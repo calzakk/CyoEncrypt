@@ -28,7 +28,9 @@ package cyoencrypt;
 
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.nio.ByteBuffer;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.security.spec.KeySpec;
 
 import javax.crypto.Cipher;
@@ -40,80 +42,214 @@ import javax.crypto.spec.SecretKeySpec;
 
 public class FileEncryptor {
 
-	public FileEncryptor() {
-		//todo
-	}
+    public void encryptFile(String pathname, String password) throws Exception {
+        final String encryptedSuffix = ".encrypted";
+        String outputPathname = pathname;
+        int suffixPos = outputPathname.indexOf(encryptedSuffix);
+        boolean isEncrypted = (suffixPos >= 0);
+        if (isEncrypted) {
+            // The file is already encrypted; decrypt it...
+            outputPathname = outputPathname.substring(0, suffixPos); // remove the suffix
+        } else {
+            // The file is not encrypted; encrypt it...
+            outputPathname += encryptedSuffix; // append the suffix
+        }
 
-	public void encryptFile(String pathname, String password) throws java.lang.Exception {
-		final String encryptedSuffix = ".encrypted";
-		String outputPathname = pathname;
-		int opmode;
-		int suffixPos = outputPathname.indexOf(encryptedSuffix);
-		if (suffixPos >= 0) {
-			// The file is already encrypted; decrypt it...
-			opmode = Cipher.DECRYPT_MODE;
-			outputPathname = outputPathname.substring(0, suffixPos); //remove the suffix
-		}
-		else {
-			// The file is not encrypted; encrypt it...
-			opmode = Cipher.ENCRYPT_MODE;
-			outputPathname += encryptedSuffix; //append the suffix
-		}
+        FileInputStream input = null;
+        FileOutputStream output = null;
+        try {
+            input = new FileInputStream(pathname);
+            output = new FileOutputStream(outputPathname);
 
-		char[] passwordChars = password.toCharArray();
-		byte[] saltBytes = hashPassword(password, "SHA-256");
-		byte[] ivBytes = hashPassword(password, "MD5");
+            encryptStream(input, output, password, isEncrypted);
 
-		SecretKeyFactory factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA1");
-		KeySpec spec = new PBEKeySpec(passwordChars, saltBytes, 65536, 128);
-		SecretKey tempKey = factory.generateSecret(spec);
-		SecretKeySpec key = new SecretKeySpec(tempKey.getEncoded(), "AES");
+            output.close();
+            output = null;
 
-		Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
-		cipher.init(opmode, key, new IvParameterSpec(ivBytes));
+            input.close();
+            input = null;
 
-		final int MaxBytes = (16 * 1024); //16KiB
-		byte[] buffer = new byte[MaxBytes];
+            System.out.println("Success");
 
-		FileInputStream input = null;
-		FileOutputStream output = null;
-		try {
-			input = new FileInputStream(pathname);
-			output = new FileOutputStream(outputPathname);
+            try {
+                new java.io.File(pathname).delete();
+            } catch (java.lang.Exception ex) {
+                System.out.println("Unable to delete original file (" + ex.getMessage() + ")");
+            }
+        } finally {
+            if (input != null)
+                input.close();
+            if (output != null)
+                output.close();
+        }
+    }
 
-			while (true) {
-				int bytesRead = input.read(buffer);
-				if (bytesRead <= 0)
-					break;
-				output.write(cipher.update(buffer, 0, bytesRead));
-			}
+    private static final int VERSION_MAJOR = 2;
+    private static final int VERSION_MINOR = 0;
+    private static final int VERSION = (VERSION_MAJOR << 16) | VERSION_MINOR;
 
-			output.write(cipher.doFinal());
+    private static final int PREAMBLE = 0x02030507; // first four primes
+    private static final int TRAILER = 0x0B0D1113; // next four primes
 
-			input.close();
-			input = null;
+    private static final int SALT_LENGTH = 32;
+    private static final int IV_LENGTH = 16;
 
-			System.out.println("Success");
+    private static final String RANDOM_ALGORITHM = "SHA1PRNG";
+    private static final String CIPHER_ALGORITHM = "AES/CBC/PKCS5Padding";
+    private static final String SECRET_KEY_FACTORY_ALGORITHM = "PBKDF2WithHmacSHA1";
+    private static final String SECRET_KEY_ALGORITHM = "AES";
 
-			try {
-				new java.io.File(pathname).delete();
-			}
-			catch (java.lang.Exception ex) {
-				System.out.println("Unable to delete original file (" + ex.getMessage() + ")");
-			}
-		}
-		finally {
-			if (input != null)
-				input.close();
-			if (output != null)
-				output.close();
-		}
-	}
+    private final class HeaderReader {
+        public HeaderReader(byte[] header) {
+            buffer_ = ByteBuffer.wrap(header);
+        }
 
-	private byte[] hashPassword(String password, String algorithm) throws java.lang.Exception {
-		byte[] bytes = password.getBytes("UTF-8");
-		MessageDigest md = MessageDigest.getInstance(algorithm);
-		md.update(bytes);
-		return md.digest();
-	}
+        public int getInt() {
+            int val = buffer_.getInt(offset_);
+            offset_ += Integer.BYTES;
+            return val;
+        }
+
+        public void getBytes(byte[] bytes) {
+            for (int i = 0; i < bytes.length; ++i) {
+                bytes[i] = buffer_.get(offset_++);
+            }
+        }
+
+        private ByteBuffer buffer_;
+        private int offset_ = 0;
+    }
+
+    private final class HeaderWriter {
+        public void create(byte[] header, byte[] salt, byte[] iv) {
+            offset_ = 0;
+            buffer_ = ByteBuffer.wrap(header);
+            addInt(PREAMBLE);
+            addInt(VERSION);
+            addBytes(salt);
+            addBytes(iv);
+            addInt(calculateChecksum(salt, iv));
+            addInt(TRAILER);
+        }
+
+        private ByteBuffer buffer_;
+        private int offset_ = 0;
+
+        private void addInt(int value) {
+            buffer_.putInt(offset_, value);
+            offset_ += Integer.BYTES;
+        }
+
+        private void addBytes(byte[] bytes) {
+            for (byte b : bytes) {
+                buffer_.put(offset_++, b);
+            }
+        }
+    }
+
+    private void encryptStream(FileInputStream input, FileOutputStream output, String password, boolean isEncrypted)
+            throws Exception {
+        char[] passwordChars = password.toCharArray();
+
+        final int MaxBytes = (16 * 1024); // 16KiB
+        byte[] buffer = new byte[MaxBytes];
+
+        byte[] saltBytes = new byte[SALT_LENGTH];
+        byte[] ivBytes = new byte[IV_LENGTH];
+        int headerSize = (Integer.BYTES * 4 + saltBytes.length + ivBytes.length);
+        assert headerSize == 64;
+        byte[] headerBytes = new byte[headerSize];
+        boolean isVersion1 = true;
+
+        if (isEncrypted) {
+            // Decrypting; attempt to read header...
+            int bytesRead = input.read(headerBytes);
+            if (bytesRead == headerBytes.length) {
+                HeaderReader headerReader = new HeaderReader(headerBytes);
+                int preamble = headerReader.getInt();
+                int version = headerReader.getInt();
+                headerReader.getBytes(saltBytes);
+                headerReader.getBytes(ivBytes);
+                int checksum = headerReader.getInt();
+                int trailer = headerReader.getInt();
+                if ((preamble == PREAMBLE) && versionIsAtLeast(version, 2, 0)
+                        && (checksum == calculateChecksum(saltBytes, ivBytes)) && (trailer == TRAILER)) {
+                    isVersion1 = false;
+                }
+            }
+            if (isVersion1) {
+                // Insecure old-style encryption...
+                saltBytes = hashPassword(password, "SHA-256");
+                ivBytes = hashPassword(password, "MD5");
+            }
+        } else {
+            // Encrypting; generate new header...
+            SecureRandom random = SecureRandom.getInstance(RANDOM_ALGORITHM);
+            random.nextBytes(saltBytes);
+            random.nextBytes(ivBytes);
+            HeaderWriter headerWriter = new HeaderWriter();
+            headerWriter.create(headerBytes, saltBytes, ivBytes);
+            output.write(headerBytes);
+        }
+
+        // Create the encryption or decryption key...
+        SecretKeyFactory factory = SecretKeyFactory.getInstance(SECRET_KEY_FACTORY_ALGORITHM);
+        KeySpec spec = new PBEKeySpec(passwordChars, saltBytes, 65536, 128);
+        SecretKey tempKey = factory.generateSecret(spec);
+        SecretKeySpec key = new SecretKeySpec(tempKey.getEncoded(), SECRET_KEY_ALGORITHM);
+        Cipher cipher = Cipher.getInstance(CIPHER_ALGORITHM);
+        int opmode = (isEncrypted ? Cipher.DECRYPT_MODE : Cipher.ENCRYPT_MODE);
+        cipher.init(opmode, key, new IvParameterSpec(ivBytes));
+
+        // Encrypt or decrypt the data...
+        if (isEncrypted && isVersion1) {
+            // Decrypt the data that wasn't actually a version 2+ header...
+            output.write(cipher.update(headerBytes, 0, headerBytes.length));
+        }
+        while (true) {
+            int bytesRead = input.read(buffer);
+            if (bytesRead <= 0)
+                break;
+            output.write(cipher.update(buffer, 0, bytesRead));
+        }
+        output.write(cipher.doFinal());
+    }
+
+    private byte[] hashPassword(String password, String algorithm) throws Exception {
+        byte[] bytes = password.getBytes("UTF-8");
+        MessageDigest md = MessageDigest.getInstance(algorithm);
+        md.update(bytes);
+        return md.digest();
+    }
+
+    private int calculateChecksum(final byte[] saltBytes, final byte[] ivBytes) {
+        int checksum = 0;
+
+        for (byte b : saltBytes) {
+            checksum = (checksum << 8) | (checksum >> 24); // rotate left 8 bits
+            checksum ^= (int) b;
+        }
+
+        for (byte b : ivBytes) {
+            checksum = (checksum >> 4) | (checksum << 28); // rotate right 4 bits
+            checksum ^= (int) b;
+        }
+
+        return checksum;
+    }
+
+    private boolean versionIsAtLeast(int version, int major, int minor) {
+        int versionMajor = (version >> 16);
+        if (versionMajor > major)
+            return true;
+        if (versionMajor < major)
+            return false;
+        assert versionMajor == major;
+
+        int versionMinor = (version & 0xffff);
+        if (versionMinor < minor)
+            return false;
+        assert versionMinor >= minor;
+        return true;
+    }
 }
