@@ -88,8 +88,8 @@ public class FileEncryptor {
     private static final int VERSION_MINOR = 0;
     private static final int VERSION = (VERSION_MAJOR << 16) | VERSION_MINOR;
 
-    private static final int PREAMBLE = 0x02030507; // first four primes
-    private static final int TRAILER = 0x0B0D1113; // next four primes
+    private static final int PREAMBLE = 0x43594F00;
+    private static final int TRAILER = 0x5A5A5A5A;
 
     private static final int SALT_LENGTH = 32;
     private static final int IV_LENGTH = 16;
@@ -110,6 +110,12 @@ public class FileEncryptor {
             return val;
         }
 
+        public long getLong() {
+            long val = buffer_.getLong(offset_);
+            offset_ += Long.BYTES;
+            return val;
+        }
+
         public void getBytes(byte[] bytes) {
             for (int i = 0; i < bytes.length; ++i) {
                 bytes[i] = buffer_.get(offset_++);
@@ -126,7 +132,10 @@ public class FileEncryptor {
             buffer_ = ByteBuffer.wrap(header);
             addInt(PREAMBLE);
             addInt(VERSION);
+            addLong(0); // reserved
+            addInt(salt.length);
             addBytes(salt);
+            addInt(iv.length);
             addBytes(iv);
             addInt(calculateChecksum(salt, iv));
             addInt(TRAILER);
@@ -138,6 +147,11 @@ public class FileEncryptor {
         private void addInt(int value) {
             buffer_.putInt(offset_, value);
             offset_ += Integer.BYTES;
+        }
+
+        private void addLong(long value) {
+            buffer_.putLong(offset_, value);
+            offset_ += Long.BYTES;
         }
 
         private void addBytes(byte[] bytes) {
@@ -156,8 +170,8 @@ public class FileEncryptor {
 
         byte[] saltBytes = new byte[SALT_LENGTH];
         byte[] ivBytes = new byte[IV_LENGTH];
-        int headerSize = (Integer.BYTES * 4 + saltBytes.length + ivBytes.length);
-        assert headerSize == 64;
+        int headerSize = (Integer.BYTES * 6 + Long.BYTES + saltBytes.length + ivBytes.length);
+        assert headerSize == 80;
         byte[] headerBytes = new byte[headerSize];
         boolean isVersion1 = true;
 
@@ -168,11 +182,15 @@ public class FileEncryptor {
                 HeaderReader headerReader = new HeaderReader(headerBytes);
                 int preamble = headerReader.getInt();
                 int version = headerReader.getInt();
+                long reserved = headerReader.getLong();
+                int saltLength = headerReader.getInt();
                 headerReader.getBytes(saltBytes);
+                int ivLength = headerReader.getInt();
                 headerReader.getBytes(ivBytes);
                 int checksum = headerReader.getInt();
                 int trailer = headerReader.getInt();
-                if ((preamble == PREAMBLE) && versionIsAtLeast(version, 2, 0)
+                if ((preamble == PREAMBLE) && versionIsAtLeast(version, 2, 0) && (reserved == 0)
+                        && (saltLength == SALT_LENGTH) && (ivLength == IV_LENGTH)
                         && (checksum == calculateChecksum(saltBytes, ivBytes)) && (trailer == TRAILER)) {
                     isVersion1 = false;
                 }
